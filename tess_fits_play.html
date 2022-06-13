@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+
+    <head>
+        <meta charset="UTF-8">
+        <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.6.0/jquery.min.js"></script>
+        <link rel="stylesheet" href="https://ajax.googleapis.com/ajax/libs/jqueryui/1.12.1/themes/smoothness/jquery-ui.css">
+        <script src="https://ajax.googleapis.com/ajax/libs/jqueryui/1.12.1/jquery-ui.min.js"></script>
+        <script src="https://cdn.plot.ly/plotly-2.12.1.min.js"></script>
+        <title>TESS Light Curve FITS Exporter</title>
+    </head>
+
+    <body>
+        <h1>TESS Light Curve FITS Exporter</h1>
+        <input type="file" id="inputFitsID" onchange="load_local_file()" style="display: none;">
+        <button id="headerShow" style="display: none;">Show Headers</button>
+        <div id="headerDialog" title="Fits Headers"><span id="headerDialogContent"></span></div>
+        <div id="notValidFits" style="display: none;">Not a recognized SPOC TESS light curve file. The Show Headers button will display the fits header contents.</div>
+        <div id="plotOutput" style="width:1024px;height:400px;"></div>
+    </body>
+
+    <script src="build/tess_fitslc_export.js"></script>
+    <script src="tess_fitslc_export_pre.js"></script>
+    <script>
+
+      // Check if there is a remote fits files in the URL call
+      var urlFile = {}
+      var query = window.location.search.substring(1).split("&");
+      for (var i=0, max=query.length; i<max; i++) {
+        if (query[i] == "") {continue;} // empty last &
+        var param = query[i].split('=');
+        urlFile[decodeURIComponent(param[0])] = decodeURIComponent(param[1] || "");
+      }
+      // If there was not a uri parameter in the URL call
+      // display the file load input
+      if (!('uri' in urlFile)) {
+        console.log('Going to load local file');
+        $("#inputFitsID").show();
+      } else {
+        console.log('Going to load a file from MAST ', urlFile['uri']);
+        load_remote_file(urlFile['uri']);
+      }
+
+      async function load_remote_file(uriWant){
+        mastURL = 'https://mast.stsci.edu/api/v0.1/Download/file?uri=';
+        let blob = await fetch(mastURL + uriWant).then(response => {
+          if (!response.ok) {
+            return null;
+          }
+          return response.blob();
+        });
+        const uint8_view = new Uint8Array(await blob.arrayBuffer());
+        FS.writeFile('temp.fits', uint8_view);
+        run_fits_exporter();
+      }
+
+      let reader= new FileReader();
+      async function load_local_file(){
+          let files = document.getElementById('inputFitsID').files;
+          let file=files[0];
+          reader.addEventListener('loadend', load_local_file_continued);
+          reader.readAsArrayBuffer(file);
+      }
+
+      async function load_local_file_continued(){
+        $('#headerShow').hide();
+        $('#headerDialogContent').html('');
+        $('#notValidFits').hide();
+        $('#plotOutput').empty();
+        let result=reader.result;
+        const uint8_view = new Uint8Array(result);
+        await FS.writeFile('temp.fits', uint8_view);
+        run_fits_exporter();
+      }
+
+      function run_fits_exporter(e){
+        // Get the header
+        var hdrret = _anyfits_getheader();
+        console.log('header read return: ',hdrret);
+        let content = FS.readFile('header.txt',{encoding:'utf8'});
+        content = content.replace(/(?:\r\n|\r|\n)/g, '<br>');
+        $('#headerDialogContent').html(content);
+        $('#headerShow').show();
+        // Verify that this is a NASA Ames file with pdc flux
+        if ((content.indexOf("ORIGIN  = 'NASA/Ames'") != -1) && (content.indexOf("TTYPE8  = 'PDCSAP_FLUX'") != -1)) {
+          idStore = array_allocate(4, 'HEAP32');
+          var retVal = _tess_fitslc_getnrows(idStore.offset);
+          console.log('Get rows return: ',retVal);
+          var nRows = idStore.data[0];
+          var nReads = idStore.data[1];
+          console.log('Got N rows: ',nRows,' EXP_NUM: ',nReads);
+          // Need to do allocate arrays, but we bin data
+          // to 10 minutes; 600 sec; 300 instrument reads
+          var binFAC = 1;
+          var useN = nRows;
+          if (nReads < 300) {
+            binFAC = Math.floor(300/nReads);
+            useN = Math.floor(nRows/binFAC);
+          }
+          console.log('Binning Factor: ',binFAC, ' bin array len: ', useN);
+
+
+          // allocate the arrays
+          timeStore = array_allocate(useN, 'HEAPF64');
+          pdcStore = array_allocate(useN, 'HEAPF32');
+          qualStore = array_allocate(useN, 'HEAPF32');
+          statStore = array_allocate(6, 'HEAPF64');
+
+          var resstat = _tess_fitslc_export(timeStore.offset, pdcStore.offset, qualStore.offset, statStore.offset, idStore.offset, binFAC, 1);
+          console.log(statStore.data);
+
+          if (resstat ==  0) { // sucessful reading of light curve fits file
+            useN = idStore.data[3];
+            kppdc = pdcStore.data.filter( (x,ii) => ii < useN);
+            kptime = timeStore.data.filter( (x,ii) => ii < useN);
+            // Calculate the sigma upper limit for data
+            let ymin = statStore.data[2];
+            let ymax = statStore.data[3];
+            let mn = statStore.data[4];
+            let sig = statStore.data[5];
+            // convert the  sigma to relative flux diff in ppt
+            let ylim = ((mn+6.0*sig)/mn - 1.0) * 1.0e3;
+            ymin = (ymin/mn - 1.0) * 1.0e3;
+            ymax = (ymax/mn - 1.0) * 1.0e3;
+            let ylimpos = ylim;
+            let ylimneg = -ylim;
+            // look for strong EB with negative flux
+            if (ymin < -ylim) {ylimneg = ymin;}
+            dotheplot(kptime, kppdc, idStore.data[0], idStore.data[1], ylimpos, ylimneg);
+          } else {
+            $('#notValidFits').show();
+          }
+        } else {
+          $('#notValidFits').show();
+        }
+      }
+
+      function dotheplot(xin, yin, tic, sector, ylimpos, ylimneg) {
+        var data1 = {
+          x: xin,
+          y: yin,
+          mode: 'markers',
+          type: 'scatter',
+          //name: 'PDC Flux',
+          //showlegend: false,
+          marker: {size:5.0, maxdisplayed:0}
+        };
+        var layout = {
+          title: {text:"TIC "+tic.toString()+" Sector "+sector.toString(),family:'helvetica'},
+          showlegend: false,
+          margin:{b:40, l:40, r:40, t:60},
+          width:1024,
+          height:640,
+          font:{size:22},
+          xaxis:{linewidth:3.0, mirror:'allticks', anchor:'free', position:0,
+                  showgrid:false, tickfont:{family:'helvetica', size:20},
+                   ticklen:10.0, tickmode:'auto',tickwidth:3.0,
+                   title:{font:{family:'helvetica',size:25}, text:'TESS Julian Date'},
+                   zeroline:false, automargin:true, nticks:10, tickmode:'auto',ticks:'inside',
+                   minor:{ticklen:5.0,ticks:'inside',tickwidth:2.0}},
+          yaxis:{linewidth:3.0, mirror:'allticks', anchor:'free', position:0,
+                   showgrid:false, tickfont:{family:'helvetica', size:20},
+                    ticklen:10.0, tickmode:'auto',tickwidth:3.0,
+                    title:{font:{family:'helvetica',size:25}, text:'Relative Flux Change [ppt]'},
+                    zeroline:false, automargin:true, nticks:10, tickmode:'auto',ticks:'inside',
+                    minor:{ticklen:5.0,ticks:'inside',tickwidth:2.0},
+                    range:[ylimneg,ylimpos]}
+        };
+        var config = {
+          responsive:true
+        };
+        Plotly.newPlot('plotOutput', [data1], layout, config);
+      }
+    </script>
+
+    <!-- Handle the header dialog -->
+    <script>
+      $(function() {
+        // Turn the headerDialog div into a dialog box with jquery
+        $('#headerDialog').dialog({
+          autoOpen: false,
+          width: 'auto',
+          height: '480',
+          resizable: true,
+          draggable: true
+        }).css("font-size", "13px");
+        // Attach opening headerDialog to headerShow button
+        $('#headerShow').click(function() {
+          $('#headerDialog').dialog("open");
+        });
+      });
+    </script>
+</html>
